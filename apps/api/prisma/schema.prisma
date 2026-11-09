@@ -1,0 +1,431 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────── Enums ─────────
+
+enum Role {
+  ADMIN
+  MANAGER
+  ANALYST
+}
+
+enum TransactionStatus {
+  CREATED
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum InvoiceStatus {
+  OPEN
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+enum MatchType {
+  EXACT
+  PARTIAL
+  MANUAL
+}
+
+enum MatchStatus {
+  SUGGESTED
+  CONFIRMED
+  REJECTED
+}
+
+enum RunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum ExceptionType {
+  DUPLICATE_TRANSACTION
+  MISSING_PAYMENT
+  AMOUNT_DISCREPANCY
+  CURRENCY_MISMATCH
+  UNMATCHED_INVOICE
+  UNMATCHED_TRANSACTION
+  FAILED_PAYMENT
+  DELAYED_EVENT
+}
+
+enum ExceptionStatus {
+  OPEN
+  INVESTIGATING
+  RESOLVED
+  DISMISSED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  IGNORED
+  FAILED
+  DEAD_LETTER
+}
+
+// ───────── Identity & tenancy ─────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships   OrganisationMembership[]
+  refreshTokens RefreshToken[]
+  assignedExceptions PaymentException[] @relation("ExceptionAssignee")
+  notifications Notification[]
+}
+
+model Organisation {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  // Default currency & reconciliation rule configuration (validated in app code)
+  baseCurrency String @default("EUR") @db.Char(3)
+  reconciliationConfig Json @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships OrganisationMembership[]
+  connections ProviderConnection[]
+  transactions Transaction[]
+  invoices Invoice[]
+  runs ReconciliationRun[]
+  matches ReconciliationMatch[]
+  exceptions PaymentException[]
+  webhookEvents WebhookEvent[]
+  auditLogs AuditLog[]
+  notifications Notification[]
+  invoicePayments InvoicePayment[]
+}
+
+model OrganisationMembership {
+  id             String   @id @default(uuid())
+  userId         String
+  organisationId String
+  role           Role
+  createdAt      DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organisationId])
+  @@index([organisationId])
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String
+  // SHA-256 of the opaque token; the raw token is never stored
+  tokenHash  String    @unique
+  // Rotation family: reuse of a revoked token revokes the whole family
+  familyId   String
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+// ───────── Providers ─────────
+
+model PaymentProvider {
+  id          String  @id @default(uuid())
+  key         String  @unique // e.g. "mock"
+  name        String
+  isSandbox   Boolean @default(true)
+
+  connections ProviderConnection[]
+}
+
+model ProviderConnection {
+  id             String   @id @default(uuid())
+  organisationId String
+  providerId     String
+  label          String
+  // AES-256-GCM encrypted JSON blobs (iv:tag:ciphertext, base64)
+  encryptedCredentials   String
+  encryptedWebhookSecret String
+  // Incremental sync cursor (opaque, provider-defined)
+  syncCursor     String?
+  lastSyncAt     DateTime?
+  lastSyncError  String?
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation    @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  provider     PaymentProvider @relation(fields: [providerId], references: [id])
+  transactions Transaction[]
+  webhookEvents WebhookEvent[]
+
+  @@index([organisationId])
+  @@index([providerId])
+}
+
+// ───────── Money records ─────────
+
+model Transaction {
+  id             String   @id @default(uuid())
+  organisationId String
+  connectionId   String
+  // Provider's own id for the payment; unique per connection → no duplicate records
+  providerRef    String
+  // Merchant-facing reference (often the invoice number); used for matching
+  reference      String?
+  customerId     String?
+  amount         Decimal  @db.Decimal(19, 4)
+  currency       String   @db.Char(3)
+  status         TransactionStatus
+  // Out-of-order protection: only apply events with a higher sequence
+  lastEventSequence BigInt @default(0)
+  lastEventAt    DateTime?
+  occurredAt     DateTime
+  metadata       Json     @default("{}")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   ProviderConnection @relation(fields: [connectionId], references: [id])
+  history      TransactionStatusHistory[]
+  invoicePayments InvoicePayment[]
+  matches      ReconciliationMatch[]
+  exceptions   PaymentException[]
+
+  @@unique([connectionId, providerRef])
+  @@index([organisationId, occurredAt])
+  @@index([organisationId, status])
+  @@index([organisationId, reference])
+  @@index([organisationId, customerId])
+}
+
+model TransactionStatusHistory {
+  id            String   @id @default(uuid())
+  transactionId String
+  fromStatus    TransactionStatus?
+  toStatus      TransactionStatus
+  eventType     String
+  // Provider event that caused this change (null for imports)
+  webhookEventId String?
+  note          String?
+  occurredAt    DateTime
+  recordedAt    DateTime @default(now())
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@index([transactionId, occurredAt])
+}
+
+model Invoice {
+  id             String   @id @default(uuid())
+  organisationId String
+  reference      String
+  customerId     String?
+  customerName   String?
+  amount         Decimal  @db.Decimal(19, 4)
+  currency       String   @db.Char(3)
+  amountPaid     Decimal  @default(0) @db.Decimal(19, 4)
+  status         InvoiceStatus @default(OPEN)
+  issuedAt       DateTime
+  dueAt          DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  payments     InvoicePayment[]
+  matches      ReconciliationMatch[]
+  exceptions   PaymentException[]
+
+  @@unique([organisationId, reference])
+  @@index([organisationId, status])
+  @@index([organisationId, dueAt])
+  @@index([organisationId, customerId])
+}
+
+// Confirmed application of (part of) a transaction to an invoice
+model InvoicePayment {
+  id             String   @id @default(uuid())
+  organisationId String
+  invoiceId      String
+  transactionId  String
+  amount         Decimal  @db.Decimal(19, 4)
+  currency       String   @db.Char(3)
+  matchId        String?  @unique
+  createdAt      DateTime @default(now())
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  invoice      Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  transaction  Transaction  @relation(fields: [transactionId], references: [id])
+  match        ReconciliationMatch? @relation(fields: [matchId], references: [id])
+
+  @@unique([invoiceId, transactionId])
+  @@index([organisationId])
+  @@index([transactionId])
+}
+
+// ───────── Reconciliation ─────────
+
+model ReconciliationRun {
+  id             String   @id @default(uuid())
+  organisationId String
+  status         RunStatus @default(RUNNING)
+  triggeredById  String?
+  configSnapshot Json     @default("{}")
+  transactionsScanned Int @default(0)
+  invoicesScanned     Int @default(0)
+  exactMatches        Int @default(0)
+  suggestedMatches    Int @default(0)
+  exceptionsRaised    Int @default(0)
+  error          String?
+  startedAt      DateTime @default(now())
+  finishedAt     DateTime?
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  matches      ReconciliationMatch[]
+
+  @@index([organisationId, startedAt])
+}
+
+model ReconciliationMatch {
+  id             String   @id @default(uuid())
+  organisationId String
+  runId          String?
+  transactionId  String
+  invoiceId      String
+  type           MatchType
+  status         MatchStatus
+  // 0–100 weighted score
+  score          Int
+  // Which criteria matched / mismatched, for reviewer transparency
+  reasons        Json     @default("[]")
+  matchedAmount  Decimal  @db.Decimal(19, 4)
+  reviewedById   String?
+  reviewedAt     DateTime?
+  note           String?
+  createdAt      DateTime @default(now())
+
+  organisation Organisation      @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  run          ReconciliationRun? @relation(fields: [runId], references: [id])
+  transaction  Transaction       @relation(fields: [transactionId], references: [id])
+  invoice      Invoice           @relation(fields: [invoiceId], references: [id])
+  invoicePayment InvoicePayment?
+
+  @@unique([transactionId, invoiceId])
+  @@index([organisationId, status])
+  @@index([runId])
+}
+
+model PaymentException {
+  id             String   @id @default(uuid())
+  organisationId String
+  type           ExceptionType
+  status         ExceptionStatus @default(OPEN)
+  transactionId  String?
+  invoiceId      String?
+  assigneeId     String?
+  // Stable key so re-running reconciliation never duplicates an exception
+  dedupeKey      String
+  summary        String
+  details        Json     @default("{}")
+  resolution     String?
+  resolvedById   String?
+  resolvedAt     DateTime?
+  notes          Json     @default("[]")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  transaction  Transaction? @relation(fields: [transactionId], references: [id])
+  invoice      Invoice?     @relation(fields: [invoiceId], references: [id])
+  assignee     User?        @relation("ExceptionAssignee", fields: [assigneeId], references: [id])
+
+  @@unique([organisationId, dedupeKey])
+  @@index([organisationId, status])
+  @@index([organisationId, type])
+}
+
+// ───────── Webhooks ─────────
+
+model WebhookEvent {
+  id             String   @id @default(uuid())
+  organisationId String
+  connectionId   String
+  // Provider-assigned event id — uniqueness is the idempotency guarantee
+  providerEventId String
+  type           String
+  // Monotonic per-payment sequence from the provider (for ordering)
+  sequence       BigInt   @default(0)
+  payload        Json
+  status         WebhookStatus @default(RECEIVED)
+  attempts       Int      @default(0)
+  lastError      String?
+  receivedAt     DateTime @default(now())
+  processedAt    DateTime?
+  nextRetryAt    DateTime?
+  duplicateCount Int      @default(0)
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   ProviderConnection @relation(fields: [connectionId], references: [id])
+
+  @@unique([connectionId, providerEventId])
+  @@index([organisationId, status])
+  @@index([organisationId, receivedAt])
+}
+
+// ───────── Audit & notifications ─────────
+
+model AuditLog {
+  id             String   @id @default(uuid())
+  organisationId String?
+  actorId        String?
+  action         String
+  entityType     String
+  entityId       String?
+  // Sanitised — never contains secrets or tokens
+  metadata       Json     @default("{}")
+  ip             String?
+  createdAt      DateTime @default(now())
+
+  organisation Organisation? @relation(fields: [organisationId], references: [id], onDelete: SetNull)
+
+  @@index([organisationId, createdAt])
+  @@index([entityType, entityId])
+}
+
+model Notification {
+  id             String   @id @default(uuid())
+  organisationId String
+  userId         String?
+  kind           String
+  title          String
+  body           String
+  entityType     String?
+  entityId       String?
+  readAt         DateTime?
+  createdAt      DateTime @default(now())
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([organisationId, createdAt])
+  @@index([userId, readAt])
+}

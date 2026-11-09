@@ -1,0 +1,16 @@
+{
+  "name": "payflow",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "infra:up": "docker compose up -d postgres redis",
+    "infra:down": "docker compose down",
+    "api:dev": "npm run start:dev -w @payflow/api",
+    "api:build": "npm run build -w @payflow/api",
+    "api:test": "npm test -w @payflow/api",
+    "web:dev": "npm run dev -w @payflow/web",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm test --workspaces --if-present"
+  }
+}

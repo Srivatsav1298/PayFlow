@@ -1,0 +1,14 @@
+node_modules
+dist
+build
+.env
+.env.*
+!.env.example
+coverage
+.expo
+*.log
+.DS_Store
+
+# Local tooling state
+.claude/
+.claude-flow/
